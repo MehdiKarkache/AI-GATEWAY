@@ -1,11 +1,44 @@
 import asyncio
 import ast
+import json
 import os
 from openai import AsyncOpenAI
-from src.analyzers.bugs import analyze_bugs
-from src.analyzers.security import analyze_security
-from src.analyzers.style import analyze_style
-from src.models import Issue, Severity
+from src.analyzers import extract_json, llm_call_with_retry
+from src.models import Issue, Severity, AnalysisResult
+
+# ── Combined prompt — 1 API call instead of 3 ────────────────────────────────
+
+_COMBINED_PROMPT = """Tu es un expert en revue de code. Analyse le code suivant sur TROIS axes :
+
+1. **Bugs** : logique incorrecte, cas non geres, erreurs de type, index hors limites, variables non initialisees
+2. **Securite** : injections, credentials hardcodes, entrees non validees, failles exploitables
+3. **Lisibilite** : nommage peu clair, fonctions trop longues, code duplique, magic numbers, non-respect des conventions
+
+Niveaux de severite :
+- critique : crash en production / faille exploitable / code incomprehensible
+- majeur   : bug probable / risque significatif / gene la comprehension
+- mineur   : bug potentiel faible / mauvaise pratique / amelioration cosmetique
+
+Reponds avec UNIQUEMENT un objet JSON (sans texte avant ni apres) :
+{json_example}
+
+Valeurs valides pour severity: "critique", "majeur", "mineur"
+Valeurs valides pour category: "bug", "securite", "lisibilite"
+Si aucun probleme : {{"issues": [], "summary": "Aucun probleme detecte."}}"""
+
+_JSON_EXAMPLE = '''{
+  "issues": [
+    {
+      "line_number": 5,
+      "severity": "majeur",
+      "category": "bug",
+      "title": "Titre court",
+      "explanation": "Explication du probleme.",
+      "suggestion": "code_corrige()"
+    }
+  ],
+  "summary": "Resume global en une phrase."
+}'''
 
 
 def validate_syntax(code: str, language: str = "Python") -> tuple[bool, str]:
@@ -29,19 +62,28 @@ def _make_client() -> AsyncOpenAI:
     )
 
 
-async def run_analysis(code: str, language: str = "Python") -> list[Issue]:
-    """Lance les 3 analyses et retourne les problemes tries par severite."""
+async def run_analysis(code: str, language: str = "Python", progress_callback=None) -> list[Issue]:
+    """Analyse complete en UN SEUL appel API (bugs + securite + lisibilite)."""
     client = _make_client()
 
-    bugs_result, security_result, style_result = await asyncio.gather(
-        analyze_bugs(code, client, language),
-        analyze_security(code, client, language),
-        analyze_style(code, client, language),
+    if progress_callback:
+        progress_callback("Sending code for analysis…")
+
+    prompt = (
+        _COMBINED_PROMPT.format(json_example=_JSON_EXAMPLE) + "\n\n"
+        f"Code {language} a analyser :\n```{language.lower()}\n{code}\n```"
     )
 
-    all_issues: list[Issue] = (
-        bugs_result.issues + security_result.issues + style_result.issues
-    )
+    raw = await llm_call_with_retry(client, prompt)
+
+    if progress_callback:
+        progress_callback("Parsing results…")
+
+    try:
+        result = AnalysisResult.model_validate_json(extract_json(raw))
+        all_issues = result.issues
+    except Exception:
+        all_issues = []
 
     severity_order = {Severity.CRITICAL: 0, Severity.MAJOR: 1, Severity.MINOR: 2}
     all_issues.sort(key=lambda i: severity_order[i.severity])

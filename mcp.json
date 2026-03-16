@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "code-review-assistant": {
+      "command": "python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": "c:\\Users\\karka\\Desktop\\code-review-assistant",
+      "env": {
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}

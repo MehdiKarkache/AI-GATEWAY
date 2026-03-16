@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "code-review-assistant": {
+      "command": "python",
+      "args": ["-m", "src.mcp_server"],
+      "env": {
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}

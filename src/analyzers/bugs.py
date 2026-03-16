@@ -1,6 +1,6 @@
 from openai import AsyncOpenAI
 from src.models import AnalysisResult
-from src.analyzers import extract_json
+from src.analyzers import extract_json, llm_call_with_retry
 
 SYSTEM_PROMPT = """
 Tu es un expert en revue de code specialise dans la detection de BUGS.
@@ -39,11 +39,7 @@ async def analyze_bugs(code: str, client: AsyncOpenAI, language: str = "Python")
         f"Valeurs valides pour category: \"bug\"\n"
         f"Si aucun bug : {{\"issues\": [], \"summary\": \"Aucun bug detecte.\"}}"
     )
-    response = await client.chat.completions.create(
-        model="google/gemma-3-4b-it:free",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = response.choices[0].message.content
+    raw = await llm_call_with_retry(client, prompt)
     try:
         return AnalysisResult.model_validate_json(extract_json(raw))
     except Exception:
