@@ -1,6 +1,10 @@
 import streamlit as st
 import asyncio
 import os
+import difflib
+import io
+import json
+import zipfile
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
@@ -24,6 +28,18 @@ st.markdown("""
 
 html, body, [class*="css"] {
     font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* ── White text for dark-background elements ── */
+.stSelectbox label, .stMultiSelect label, .stFileUploader label,
+.stTextArea label, .stTextInput label, .stRadio label, .stNumberInput label {
+    color: #ffffff !important;
+}
+[data-baseweb="select"] * {
+    color: #ffffff !important;
+}
+[data-testid="stSidebar"] * {
+    color: #ffffff !important;
 }
 
 /* ── Tabs ── */
@@ -294,6 +310,104 @@ EXT_TO_LANG = {
 }
 
 
+# ── Visual Diff helper ────────────────────────────────────────────────────────
+def _render_diff(original: str, fixed: str):
+    """Render a side-by-side diff between original and fixed code."""
+    orig_lines = original.splitlines()
+    fixed_lines = fixed.splitlines()
+    diff = list(difflib.unified_diff(orig_lines, fixed_lines, lineterm="", n=3))
+
+    if not diff:
+        st.info("No differences found — code is identical.")
+        return
+
+    html_lines = []
+    for line in diff[2:]:  # skip --- +++ headers
+        if line.startswith("@@"):
+            html_lines.append(
+                f"<div style='background:#161b22;color:#8b949e;padding:4px 12px;"
+                f"font-size:11px;font-family:monospace;border-top:1px solid #21262d;"
+                f"border-bottom:1px solid #21262d;margin:4px 0'>{line}</div>"
+            )
+        elif line.startswith("-"):
+            escaped = line[1:].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            html_lines.append(
+                f"<div style='background:#3d1117;color:#f85149;padding:2px 12px;"
+                f"font-size:12px;font-family:\"JetBrains Mono\",monospace;white-space:pre'>"
+                f"- {escaped}</div>"
+            )
+        elif line.startswith("+"):
+            escaped = line[1:].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            html_lines.append(
+                f"<div style='background:#0d2818;color:#3fb950;padding:2px 12px;"
+                f"font-size:12px;font-family:\"JetBrains Mono\",monospace;white-space:pre'>"
+                f"+ {escaped}</div>"
+            )
+        else:
+            escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            html_lines.append(
+                f"<div style='color:#8b949e;padding:2px 12px;"
+                f"font-size:12px;font-family:\"JetBrains Mono\",monospace;white-space:pre'>"
+                f"  {escaped}</div>"
+            )
+
+    st.markdown(
+        "<p style='color:#484f58;font-size:10px;font-family:monospace;"
+        "text-transform:uppercase;letter-spacing:1px;margin-top:16px;margin-bottom:4px'>DIFF VIEW</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div style='background:#0d1117;border:1px solid #21262d;border-radius:10px;"
+        f"overflow:hidden;max-height:500px;overflow-y:auto'>{''.join(html_lines)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ── PDF Export helper ─────────────────────────────────────────────────────────
+def _generate_pdf(issues, filename, score):
+    """Generate a PDF report and return the bytes."""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "Code Review Report", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, f"File: {filename}    Score: {score}/100", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Summary counts
+    from src.models import Severity as Sev
+    crit = sum(1 for i in issues if i.severity == Sev.CRITICAL)
+    maj = sum(1 for i in issues if i.severity == Sev.MAJOR)
+    minor = sum(1 for i in issues if i.severity == Sev.MINOR)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, f"Issues: {len(issues)} total  |  {crit} critical  |  {maj} major  |  {minor} minor",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Issues
+    for idx, issue in enumerate(issues, 1):
+        sev = SEVERITY_LABEL.get(issue.severity, "?")
+        cat = CATEGORY_LABEL.get(issue.category.value, "?")
+        line = f"L{issue.line_number}" if issue.line_number else "global"
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.cell(0, 7, f"#{idx}  [{sev}] [{cat}]  {line} - {issue.title}", new_x="LMARGIN", new_y="NEXT", fill=True)
+
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(0, 5, f"Explanation: {issue.explanation}")
+        pdf.set_font("Courier", "", 8)
+        pdf.multi_cell(0, 4, f"Suggestion: {issue.suggestion}")
+        pdf.ln(2)
+
+    return pdf.output()
+
+
 # ── Issue card ────────────────────────────────────────────────────────────────
 def _issue_card(issue, idx: int, syntax: str):
     sev_color = SEVERITY_COLOR[issue.severity]
@@ -444,6 +558,19 @@ def display_results(issues: list, filename: str, language: str):
     for idx, issue in enumerate(filtered, 1):
         _issue_card(issue, idx, syntax)
 
+    # PDF export button
+    try:
+        pdf_bytes = _generate_pdf(issues, filename, score)
+        st.download_button(
+            label="Export PDF Report",
+            data=pdf_bytes,
+            file_name=f"review_{filename.replace('.', '_')}.pdf",
+            mime="application/pdf",
+            key=f"pdf_{filename}",
+        )
+    except Exception:
+        pass  # fpdf2 not installed — silently skip
+
     save_review(filename, issues)
 
 
@@ -459,7 +586,9 @@ def _handle_error(msg: str):
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_editor, tab_upload, tab_mcp = st.tabs(["Code Editor", "Upload File", "MCP Console"])
+tab_editor, tab_upload, tab_multi, tab_dashboard, tab_mcp = st.tabs([
+    "Code Editor", "Upload File", "Multi-File", "Dashboard", "MCP Console",
+])
 
 # ── Tab 1 : Code Editor (PRIMARY — IDE-style) ─────────────────────────────────
 with tab_editor:
@@ -611,6 +740,9 @@ with tab_editor:
                             </p>
                             """, unsafe_allow_html=True)
                             st.code(result.get("fixed_code", code_input), language=LANG_SYNTAX.get(language, "text"), line_numbers=True)
+
+                            # Visual diff
+                            _render_diff(code_input, result.get("fixed_code", code_input))
 
                     elif action_mode == "Explain Code":
                         with st.spinner("Explaining code..."):
@@ -777,6 +909,7 @@ with tab_upload:
                     unsafe_allow_html=True,
                 )
                 st.code(result.get("fixed_code", ""), language=LANG_SYNTAX.get(language_up, "text"), line_numbers=True)
+                _render_diff(code_up, result.get("fixed_code", ""))
             else:
                 st.error(result["error"])
 
@@ -801,7 +934,276 @@ with tab_upload:
                 st.error(result["error"])
 
 
-# ── Tab 3 : MCP Console ───────────────────────────────────────────────────────
+# ── Tab 3 : Multi-File Analysis ───────────────────────────────────────────────
+with tab_multi:
+    st.markdown("""
+    <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;
+                padding:16px 24px;margin-bottom:20px">
+        <div style="display:flex;align-items:center;gap:12px">
+            <span style="color:#a371f7;font-size:20px;font-family:monospace">&#128230;</span>
+            <span style="color:#c9d1d9;font-weight:600;font-size:15px">Multi-File Analysis</span>
+            <span style="color:#484f58;font-size:12px">
+                — Upload a .zip archive to analyze all source files at once
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    zip_file = st.file_uploader(
+        "Upload a .zip archive",
+        type=["zip"],
+        help="Upload a zip containing source files (.py, .js, .ts, .java, etc.)",
+        key="zip_upload",
+    )
+
+    if zip_file:
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(zip_file.read()))
+        except zipfile.BadZipFile:
+            st.error("Invalid zip file.")
+            st.stop()
+
+        source_files = []
+        for name in zf.namelist():
+            if name.endswith("/") or name.startswith("__") or "/.git/" in name:
+                continue
+            ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext in EXT_TO_LANG:
+                try:
+                    content = zf.read(name).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if len(content.splitlines()) <= 500 and content.strip():
+                    source_files.append((name, EXT_TO_LANG[ext], content))
+
+        if not source_files:
+            st.warning("No supported source files found in the archive.")
+        else:
+            st.markdown(
+                f"<p style='color:#8b949e;font-size:12px;font-family:monospace;margin:8px 0'>"
+                f"Found <b style='color:#c9d1d9'>{len(source_files)}</b> source file(s)</p>",
+                unsafe_allow_html=True,
+            )
+            for name, lang, _ in source_files:
+                st.markdown(
+                    f"<span style='background:#0d1117;border:1px solid #21262d;border-radius:6px;"
+                    f"padding:2px 10px;font-size:11px;font-family:monospace;color:#58a6ff;"
+                    f"margin-right:4px;display:inline-block;margin-bottom:4px'>"
+                    f"{name} <span style='color:#484f58'>({lang})</span></span>",
+                    unsafe_allow_html=True,
+                )
+
+            if st.button("Analyze All Files", type="primary", key="btn_multi_analyze"):
+                all_results = {}
+                progress = st.progress(0, text="Starting analysis...")
+
+                for file_idx, (name, lang, code) in enumerate(source_files):
+                    progress.progress(
+                        (file_idx) / len(source_files),
+                        text=f"Analyzing {name}...",
+                    )
+                    valid, err = validate_syntax(code, lang)
+                    if not valid:
+                        all_results[name] = {"language": lang, "issues": [], "error": err}
+                        continue
+                    try:
+                        issues = asyncio.run(run_analysis(code, lang))
+                        all_results[name] = {"language": lang, "issues": issues, "error": None}
+                    except Exception as e:
+                        all_results[name] = {"language": lang, "issues": [], "error": str(e)}
+
+                progress.progress(1.0, text="Analysis complete!")
+
+                # Summary
+                total_files = len(all_results)
+                total_issues = sum(len(r["issues"]) for r in all_results.values())
+                errors = sum(1 for r in all_results.values() if r["error"])
+                avg_score = 0
+                scores = []
+                for r in all_results.values():
+                    if r["issues"] is not None:
+                        c = sum(1 for i in r["issues"] if i.severity == Severity.CRITICAL)
+                        m = sum(1 for i in r["issues"] if i.severity == Severity.MAJOR)
+                        n = sum(1 for i in r["issues"] if i.severity == Severity.MINOR)
+                        scores.append(max(0, 100 - c * 25 - m * 10 - n * 3))
+                if scores:
+                    avg_score = sum(scores) // len(scores)
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Files Analyzed", total_files)
+                with c2:
+                    st.metric("Total Issues", total_issues)
+                with c3:
+                    st.metric("Avg Score", f"{avg_score}/100")
+                with c4:
+                    st.metric("Errors", errors)
+
+                # Per-file results
+                for name, data in all_results.items():
+                    if data["error"]:
+                        st.warning(f"**{name}**: {data['error']}")
+                    elif data["issues"]:
+                        display_results(data["issues"], name, data["language"])
+                    else:
+                        st.success(f"**{name}** — No issues found!")
+
+
+# ── Tab 4 : Dashboard ─────────────────────────────────────────────────────────
+with tab_dashboard:
+    st.markdown("""
+    <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;
+                padding:16px 24px;margin-bottom:20px">
+        <div style="display:flex;align-items:center;gap:12px">
+            <span style="color:#d29922;font-size:20px;font-family:monospace">&#128202;</span>
+            <span style="color:#c9d1d9;font-weight:600;font-size:15px">Analytics Dashboard</span>
+            <span style="color:#484f58;font-size:12px">
+                — Visual overview of your review history
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    records = get_recent_reviews(limit=100)
+
+    if not records:
+        st.info("No review history yet. Run some analyses to see charts here.")
+    else:
+        import plotly.graph_objects as go
+
+        # Compute data from records
+        dash_scores = []
+        dash_dates = []
+        dash_critical = 0
+        dash_major = 0
+        dash_minor = 0
+        lang_counts = {}
+
+        for r in reversed(records):  # oldest first for timeline
+            c = r.critical_count
+            m = r.major_count
+            n = r.minor_count
+            s = max(0, 100 - c * 25 - m * 10 - n * 3)
+            dash_scores.append(s)
+            dash_dates.append(r.created_at[:16])
+            dash_critical += c
+            dash_major += m
+            dash_minor += n
+            ext = "." + r.filename.rsplit(".", 1)[-1].lower() if "." in r.filename else ""
+            lang = EXT_TO_LANG.get(ext, "Other")
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+        avg = sum(dash_scores) // len(dash_scores) if dash_scores else 0
+        best = max(dash_scores) if dash_scores else 0
+        worst = min(dash_scores) if dash_scores else 0
+
+        # KPI row
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Total Reviews", len(records))
+        with k2:
+            st.metric("Avg Score", f"{avg}/100")
+        with k3:
+            st.metric("Best Score", f"{best}/100")
+        with k4:
+            st.metric("Total Issues", dash_critical + dash_major + dash_minor)
+
+        chart_col1, chart_col2 = st.columns(2)
+
+        # Score over time line chart
+        with chart_col1:
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(
+                x=list(range(1, len(dash_scores) + 1)),
+                y=dash_scores,
+                mode="lines+markers",
+                line=dict(color="#6c63ff", width=2),
+                marker=dict(size=6, color="#6c63ff"),
+                hovertext=dash_dates,
+                hoverinfo="text+y",
+            ))
+            fig_line.update_layout(
+                title=dict(text="Score Over Time", font=dict(color="#c9d1d9", size=14)),
+                paper_bgcolor="#0d1117",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", size=11),
+                xaxis=dict(title="Review #", gridcolor="#21262d", zeroline=False),
+                yaxis=dict(title="Score", gridcolor="#21262d", zeroline=False, range=[0, 105]),
+                margin=dict(l=40, r=20, t=40, b=40),
+                height=320,
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+
+        # Issues by severity pie chart
+        with chart_col2:
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=["Critical", "Major", "Minor"],
+                values=[dash_critical, dash_major, dash_minor],
+                marker=dict(colors=["#f85149", "#d29922", "#58a6ff"]),
+                hole=0.45,
+                textinfo="label+value",
+                textfont=dict(size=12),
+            )])
+            fig_pie.update_layout(
+                title=dict(text="Issues by Severity", font=dict(color="#c9d1d9", size=14)),
+                paper_bgcolor="#0d1117",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", size=11),
+                margin=dict(l=20, r=20, t=40, b=20),
+                height=320,
+                showlegend=True,
+                legend=dict(font=dict(color="#c9d1d9")),
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        chart_col3, chart_col4 = st.columns(2)
+
+        # Languages analyzed bar chart
+        with chart_col3:
+            lang_names = list(lang_counts.keys())
+            lang_vals = list(lang_counts.values())
+            fig_bar = go.Figure(data=[go.Bar(
+                x=lang_names,
+                y=lang_vals,
+                marker_color="#6c63ff",
+                text=lang_vals,
+                textposition="outside",
+                textfont=dict(color="#c9d1d9"),
+            )])
+            fig_bar.update_layout(
+                title=dict(text="Languages Analyzed", font=dict(color="#c9d1d9", size=14)),
+                paper_bgcolor="#0d1117",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", size=11),
+                xaxis=dict(gridcolor="#21262d"),
+                yaxis=dict(gridcolor="#21262d", zeroline=False),
+                margin=dict(l=40, r=20, t=40, b=40),
+                height=320,
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        # Score distribution histogram
+        with chart_col4:
+            fig_hist = go.Figure(data=[go.Histogram(
+                x=dash_scores,
+                nbinsx=10,
+                marker_color="#3fb950",
+                marker_line=dict(color="#238636", width=1),
+            )])
+            fig_hist.update_layout(
+                title=dict(text="Score Distribution", font=dict(color="#c9d1d9", size=14)),
+                paper_bgcolor="#0d1117",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", size=11),
+                xaxis=dict(title="Score", gridcolor="#21262d", range=[0, 105]),
+                yaxis=dict(title="Count", gridcolor="#21262d", zeroline=False),
+                margin=dict(l=40, r=20, t=40, b=40),
+                height=320,
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+
+# ── Tab 5 : MCP Console ───────────────────────────────────────────────────────
 with tab_mcp:
     st.markdown("""
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;
